@@ -1,0 +1,6 @@
+# POSIX project — keep LF line endings everywhere.
+* text=auto eol=lf
+*.c  text eol=lf
+*.h  text eol=lf
+*.sh text eol=lf
+*.csh text eol=lf

@@ -1,0 +1,14 @@
+# Compiled binaries / build artifacts
+client
+server
+so_client
+so_server
+*.o
+
+# Runtime IPC artifacts
+fifo_req_*
+fifo_res_*
+server_pids.txt
+
+# Course materials (sprawozdania, archiwa)
+Studiowe/
