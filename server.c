@@ -33,6 +33,18 @@ void handle_signal(int sig) {
     keep_running = 0;
 }
 
+// Odczytuje dokładnie len bajtów z deskryptora fd w pętli.
+// Zwraca 0 przy sukcesie, -1 przy błędzie lub zamknięciu potoku.
+static int read_all(int fd, void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t r = read(fd, (char *)buf + total, len - total);
+        if (r <= 0) return -1;
+        total += (size_t)r;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "Uzycie: %s <ID_SERWERA>\n", argv[0]);
@@ -73,10 +85,13 @@ int main(int argc, char *argv[]) {
 
         // Odczyt ile danych należy odczytać w następnym kroku
         int n;
-        if (read(fd_req, &n, sizeof(int)) <= 0) {
+        // Częściowy odczyt nagłówka — read() może oddać <4 bajty, więc read_all() pętli aż do kompletu
+        if (read_all(fd_req, &n, sizeof(int)) < 0) {
             close(fd_req);
             break;
         }
+        // Walidacja n z potoku — zabezpiecza malloc(n*sizeof(int)) przed n<=0
+        if (n <= 0) { close(fd_req); break; }
 
         // Odczyt właściwych danych
         int *row = (int *)malloc(n * sizeof(int));
@@ -84,7 +99,7 @@ int main(int argc, char *argv[]) {
             close(fd_req);
             break;
         }
-        if (read(fd_req, row, n * sizeof(int)) <= 0) {
+        if (read_all(fd_req, row, n * sizeof(int)) < 0) {
             free(row);
             close(fd_req);
             break;

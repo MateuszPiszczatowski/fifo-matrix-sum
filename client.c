@@ -45,6 +45,9 @@ int main(int argc, char *argv[]) {
 
     int n = atoi(argv[1]);
 
+    // Walidacja N — atoi() cicho zwraca 0 dla tekstu i wartości ujemnych
+    if (n <= 0) { fprintf(stderr, "Blad: N musi byc dodatnia liczba calkowita\n"); exit(EXIT_FAILURE); }
+
     // Generowanie i wypisanie losowej macierzy N x N
     int **matrix = (int **)malloc(n * sizeof(int *));
     if (matrix == NULL) {
