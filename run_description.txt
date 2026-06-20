@@ -1,0 +1,81 @@
+#!/bin/sh
+
+# run.sh — pomocniczy skrypt uruchamiający środowisko testowe
+#
+# Uwaga: plik ten nie jest częścią wymagań projektowych. Projekt właściwy
+# stanowią server.c i client.c. Skrypt ten demonstruje przykładowy sposób
+# uruchomienia aplikacji: kompiluje oba programy, startuje N serwerów w tle,
+# uruchamia klienta i sprząta środowisko po zakończeniu.
+#
+# Uruchomienie: sh run.sh
+# Zmiana rozmiaru macierzy: modyfikacja zmiennej N w skrypcie.
+
+
+# =============================================================================
+# INICJALIZACJA
+# =============================================================================
+
+# PID każdego serwera uruchomionego w tle jest zapisywany do tego pliku,
+# po jednym na linię. Plik usuwany na starcie, by nie czytać PID-ów
+# z poprzedniego, ewentualnie przerwanego uruchomienia.
+PID_FILE="server_pids.txt"
+rm -f "$PID_FILE"
+
+
+# =============================================================================
+# KOMPILACJA
+# =============================================================================
+
+gcc server.c -o so_server
+gcc client.c -o so_client
+
+
+# =============================================================================
+# URUCHAMIANIE SERWERÓW W TLE
+# =============================================================================
+
+N=4  # Rozmiar macierzy i liczba serwerów; klient musi być wywołany z tą samą wartością.
+
+echo "--- Uruchamianie $N serwerow w tle ---"
+i=0
+while [ "$i" -lt "$N" ]; do
+    # Serwer uruchamiany w tle (&). $! zawiera PID ostatnio odłączonego procesu
+    # i jest natychmiast dopisywany do pliku PID.
+    ./so_server "$i" & echo $! >> "$PID_FILE"
+    i=$((i + 1))
+done
+
+# Krótka przerwa daje serwerom czas na wywołanie mkfifo() i zablokowanie
+# na open(). Bez niej klient mógłby próbować otworzyć FIFO zanim serwer
+# je utworzy, co zakończyłoby się błędem.
+sleep 1
+
+
+# =============================================================================
+# URUCHAMIANIE KLIENTA
+# =============================================================================
+
+printf "\n--- Uruchamianie Klienta ---\n"
+# Klient blokuje do zakończenia — skrypt czeka na wynik przed przystąpieniem
+# do sprzątania.
+./so_client "$N"
+
+
+# =============================================================================
+# ZAMKNIĘCIE SERWERÓW I SPRZĄTANIE
+# =============================================================================
+
+printf "\n--- Zamykanie srodowiska ---\n"
+
+# Wysłanie SIGTERM do każdego serwera na podstawie zapisanych PID.
+# Serwery przechwytują sygnał, ustawiają flagę keep_running=0,
+# po czym usuwają swoje kolejki FIFO i kończą działanie.
+if [ -f "$PID_FILE" ]; then
+    while read -r pid; do
+        kill "$pid" 2>/dev/null
+    done < "$PID_FILE"
+    rm -f "$PID_FILE"
+fi
+
+# Usunięcie plików wykonywalnych — środowisko wraca do stanu sprzed kompilacji.
+rm -f so_server so_client

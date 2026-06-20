@@ -1,0 +1,158 @@
+/*
+ * client.c — klient generujący macierz i zbierający sumy wierszy
+ *
+ * Klient generuje losową macierz N×N i rozdziela jej wiersze między N serwerów
+ * za pomocą kolejek FIFO. Obliczenia przebiegają dwufazowo, co zapewnia
+ * współbieżność: w Fazie 1 klient wysyła dane do wszystkich serwerów (każdy
+ * zaczyna liczyć zaraz po odebraniu wiersza), a dopiero w Fazie 2 zbiera
+ * wyniki. Dzięki rozdzieleniu faz serwery pracują równolegle.
+ *
+ * Uruchomienie: ./so_client <N>
+ */
+
+
+/* =============================================================================
+ * NAGŁÓWKI
+ * ============================================================================= */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+
+
+/* =============================================================================
+ * POMOCNICZA FUNKCJA free_matrix
+ * ============================================================================= */
+
+/* Zwalnia rows wierszy macierzy oraz sam wskaźnik tablicy.
+ * Używana we wszystkich ścieżkach wyjścia z błędem, żeby nie powielać
+ * tej samej pętli free w każdym bloku obsługi błędu. */
+static void free_matrix(int **m, int rows) {
+    for (int i = 0; i < rows; i++) {
+        free(m[i]);
+    }
+    free(m);
+}
+
+
+/* =============================================================================
+ * MAIN — WALIDACJA ARGUMENTÓW I GENEROWANIE MACIERZY
+ * ============================================================================= */
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Uzycie: %s <Rozmiar_N>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    int n = atoi(argv[1]);
+
+    /* Walidacja N. Bez niej atoi() cicho zwraca
+     * 0 dla argumentu nieliczbowego (np. "abc") — dawało pustą "macierz" i sumę
+     * 0 udającą poprawny wynik; wartość ujemna prowadziła do malloc() z ogromnym
+     * rozmiarem po rzutowaniu na size_t. */
+    if (n <= 0) { fprintf(stderr, "Blad: N musi byc dodatnia liczba calkowita\n"); exit(EXIT_FAILURE); }
+
+    /* Alokacja macierzy N×N jako tablicy wskaźników do wierszy. Każdy wiersz
+     * alokowany jest osobno, co umożliwia bezpośrednie wysyłanie wskaźnika
+     * wiersza do write() bez pośredniego kopiowania. */
+    int **matrix = (int **)malloc(n * sizeof(int *));
+    if (matrix == NULL) {
+        fprintf(stderr, "malloc: brak pamieci\n");
+        exit(EXIT_FAILURE);
+    }
+    srand(time(NULL));
+    printf("[Klient] Wygenerowana macierz %dx%d:\n", n, n);
+    for (int i = 0; i < n; i++) {
+        matrix[i] = (int *)malloc(n * sizeof(int));
+        /* Przy błędzie alokacji i-tego wiersza: zwolnij wiersze 0..i-1
+         * oraz tablicę wskaźników, a dopiero potem zakończ. */
+        if (matrix[i] == NULL) {
+            fprintf(stderr, "malloc: brak pamieci\n");
+            free_matrix(matrix, i);
+            exit(EXIT_FAILURE);
+        }
+        for (int j = 0; j < n; j++) {
+            matrix[i][j] = rand() % 10;
+            printf("%d ", matrix[i][j]);
+        }
+        printf("\n");
+    }
+
+
+/* =============================================================================
+ * FAZA 1 — ROZESŁANIE DANYCH DO SERWERÓW
+ * ============================================================================= */
+
+    /* Klient otwiera kolejno FIFO żądań każdego serwera i wysyła wiersz.
+     * Każde open() odblokowuje czekający serwer, który natychmiast przystępuje
+     * do obliczania sumy. Zanim klient wyśle dane do serwera N-1, serwery
+     * 0..N-2 są już w trakcie sumowania — to jest źródło współbieżności.
+     * Gdyby klient czekał na wynik po wysłaniu każdego wiersza z osobna,
+     * serwery działałyby sekwencyjnie. */
+    char fifo_name[32];
+    for (int i = 0; i < n; i++) {
+        sprintf(fifo_name, "fifo_req_%d", i);
+        int fd_req = open(fifo_name, O_WRONLY); /* Odblokowuje serwer i */
+        if (fd_req == -1) {
+            perror("Blad otwarcia FIFO do zapisu. Czy serwery dzialaja?");
+            free_matrix(matrix, n);
+            exit(EXIT_FAILURE);
+        }
+
+        /* Protokół: rozmiar wiersza (int), a następnie dane wiersza.
+         * Rozmiar przesyłany oddzielnie pozwala serwerowi alokować bufor
+         * dokładnej długości bez wcześniejszej wiedzy o N. */
+        write(fd_req, &n, sizeof(int));
+        write(fd_req, matrix[i], n * sizeof(int));
+        close(fd_req);
+    }
+    printf("[Klient] Rozeslano wszystkie wiersze. Trwaja obliczenia wspolbiezne...\n");
+
+
+/* =============================================================================
+ * FAZA 2 — ZBIERANIE WYNIKÓW
+ * ============================================================================= */
+
+    /* Klient otwiera kolejno FIFO odpowiedzi każdego serwera i odbiera sumę.
+     * Każde open() blokuje do momentu, gdy dany serwer zakończy obliczenia
+     * i zapisze wynik. Serwery mogą kończyć pracę w dowolnej kolejności —
+     * klient i tak w końcu odbierze wynik od każdego z nich. */
+    int total_sum = 0;
+    for (int i = 0; i < n; i++) {
+        sprintf(fifo_name, "fifo_res_%d", i);
+        int fd_res = open(fifo_name, O_RDONLY); /* Blokuje aż serwer i wyśle wynik */
+        if (fd_res == -1) {
+            perror("Blad otwarcia FIFO do odczytu");
+            free_matrix(matrix, n);
+            exit(EXIT_FAILURE);
+        }
+
+        int partial_sum;
+        if (read(fd_res, &partial_sum, sizeof(int)) <= 0) {
+            perror("Blad odczytu z FIFO");
+            close(fd_res);
+            free_matrix(matrix, n);
+            exit(EXIT_FAILURE);
+        }
+        close(fd_res);
+
+        printf("[Klient] Suma czastkowa z serwera %d = %d\n", i, partial_sum);
+        total_sum += partial_sum;
+    }
+
+    printf("\n[Klient] SUMA CALKOWITA WYNOSI: %d\n", total_sum);
+
+
+/* =============================================================================
+ * ZWOLNIENIE PAMIĘCI
+ * ============================================================================= */
+
+    free_matrix(matrix, n);
+
+    return 0;
+}

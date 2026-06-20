@@ -1,0 +1,189 @@
+/*
+ * server.c — iteracyjny serwer POSIX obliczający sumę wiersza macierzy
+ *
+ * Serwer przyjmuje jeden argument: swój numer (ID). Na jego podstawie tworzy
+ * parę kolejek FIFO: do odbioru danych (fifo_req_<ID>) i do wysyłki wyniku
+ * (fifo_res_<ID>). W pętli oczekuje na dane od klienta, oblicza sumę
+ * przesłanego wiersza i odsyła wynik. Serwer jest iteracyjny — obsługuje
+ * jedno żądanie na raz i nie tworzy procesów potomnych.
+ *
+ * Uruchomienie: ./so_server <ID>
+ */
+
+
+/* =============================================================================
+ * NAGŁÓWKI I ZMIENNE GLOBALNE
+ * ============================================================================= */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <signal.h>
+
+/* Flaga atomowa sterująca pętlą główną. Typ volatile sig_atomic_t gwarantuje
+ * bezpieczny odczyt i zapis z procedury obsługi sygnału bez ryzyka
+ * częściowego odczytu wartości w architekturach wielordzeniowych. */
+volatile sig_atomic_t keep_running = 1;
+
+
+/* =============================================================================
+ * OBSŁUGA SYGNAŁÓW
+ * ============================================================================= */
+
+/* Procedura obsługi sygnałów SIGTERM i SIGINT. Samo ustawienie flagi wystarczy
+ * — serwer sprawdzi ją przy następnym obrocie pętli lub po powrocie
+ * z przerwanego wywołania systemowego. */
+void handle_signal(int sig) {
+    keep_running = 0;
+}
+
+
+/* =============================================================================
+ * POMOCNICZA FUNKCJA read_all
+ * ============================================================================= */
+
+/* Odczytuje dokładnie len bajtów z deskryptora fd w pętli.
+ * Zwraca 0 przy sukcesie, -1 przy błędzie lub zamknięciu potoku.
+ *
+ * Pojedyncze wywołanie read() może zwrócić mniej bajtów niż żądano
+ * (partial read), co przy dużych danych lub obciążonym systemie jest
+ * zachowaniem prawidłowym. Pętla gwarantuje odebranie kompletnego komunikatu. */
+static int read_all(int fd, void *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t r = read(fd, (char *)buf + total, len - total);
+        if (r <= 0) return -1;
+        total += (size_t)r;
+    }
+    return 0;
+}
+
+
+/* =============================================================================
+ * MAIN — WALIDACJA ARGUMENTÓW I KONFIGURACJA SYGNAŁÓW
+ * ============================================================================= */
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Uzycie: %s <ID_SERWERA>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    int server_id = atoi(argv[1]);
+    char req_fifo[32], res_fifo[32];
+
+    struct sigaction sa;
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    /* sa_flags = 0 jest tu celowe: po przerwaniu przez sygnał wywołanie
+     * open() NIE jest automatycznie wznawiane (brak SA_RESTART). Zamiast tego
+     * zwraca błąd EINTR, co pozwala pętli sprawdzić flagę keep_running
+     * i wyjść bez czekania na kolejne połączenie klienta. */
+    sa.sa_flags = 0;
+
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+
+/* =============================================================================
+ * TWORZENIE KOLEJEK FIFO
+ * ============================================================================= */
+
+    /* Nazwy kolejek zawierają ID serwera, co gwarantuje unikalność każdej pary
+     * w systemie plików. Uprawnienia 0666 pozwalają klientowi na otwarcie
+     * obu kolejek zarówno do zapisu (fifo_req), jak i do odczytu (fifo_res). */
+    sprintf(req_fifo, "fifo_req_%d", server_id);
+    sprintf(res_fifo, "fifo_res_%d", server_id);
+
+    mkfifo(req_fifo, 0666);
+    mkfifo(res_fifo, 0666);
+
+    printf("[Serwer %d] Uruchomiony iteracyjnie. Czekam na zadania...\n", server_id);
+
+
+/* =============================================================================
+ * GŁÓWNA PĘTLA PRZETWARZANIA
+ * ============================================================================= */
+
+    while (keep_running) {
+
+        /* open() na FIFO z O_RDONLY blokuje do momentu, gdy klient otworzy
+         * drugi koniec do zapisu. Jeśli w trakcie oczekiwania przyjdzie sygnał
+         * (keep_running = 0), open() zwróci -1/EINTR i pętla zakończy się. */
+        int fd_req = open(req_fifo, O_RDONLY);
+
+        if (fd_req == -1) {
+            if (!keep_running) break;
+            continue;
+        }
+
+        /* Protokół dwuetapowy: najpierw rozmiar wiersza (int), potem dane.
+         * Odczyt rozmiaru jako osobnego komunikatu pozwala dynamicznie alokować
+         * bufor dokładnej długości zamiast zakładać górne ograniczenie N. */
+        int n;
+        /* Nagłówek czytany przez read_all zamiast
+         * pojedynczego read(): chroni przed częściowym odczytem 4-bajtowego int
+         * (read() może oddać <4 bajty). Spójne z odczytem właściwych danych poniżej. */
+        if (read_all(fd_req, &n, sizeof(int)) < 0) {
+            close(fd_req);
+            break;
+        }
+        /* Walidacja n z potoku — zabezpiecza
+         * malloc(n * sizeof(int)) przed wartością zerową lub ujemną przesłaną
+         * przez błędnego/uszkodzonego klienta. */
+        if (n <= 0) { close(fd_req); break; }
+
+        /* Przy błędzie malloc lub partial read: zamknięcie fd i break zamiast
+         * exit() — gwarantuje wykonanie bloku sprzątającego unlink() na końcu. */
+        int *row = (int *)malloc(n * sizeof(int));
+        if (row == NULL) {
+            close(fd_req);
+            break;
+        }
+        if (read_all(fd_req, row, n * sizeof(int)) < 0) {
+            free(row);
+            close(fd_req);
+            break;
+        }
+        close(fd_req);
+
+        /* Obliczenie sumy częściowej przydzielonego wiersza. */
+        int partial_sum = 0;
+        for (int i = 0; i < n; i++) {
+            partial_sum += row[i];
+        }
+
+        free(row);
+
+        /* open() na FIFO z O_WRONLY blokuje do momentu, gdy klient (Faza 2)
+         * otworzy ten koniec do odczytu. Stanowi naturalną barierę
+         * synchronizacji: serwer "czeka" z wynikiem aż klient będzie gotowy. */
+        int fd_res = open(res_fifo, O_WRONLY);
+        if (fd_res == -1) {
+            break;
+        }
+        if (write(fd_res, &partial_sum, sizeof(int)) < 0) {
+            close(fd_res);
+            break;
+        }
+        close(fd_res);
+    }
+
+
+/* =============================================================================
+ * SPRZĄTANIE I WYJŚCIE
+ * ============================================================================= */
+
+    printf("\n[Serwer %d] Otrzymano sygnal lub zamknieto potok. Zamykam iteracje, sprzatam FIFO i wychodze!\n", server_id);
+
+    /* Usunięcie kolejek FIFO z systemu plików. Wszystkie ścieżki błędów
+     * wewnątrz pętli używają break (nie exit()), żeby ten blok zawsze się
+     * wykonał — FIFO nie pozostają jako martwe wpisy w systemie plików. */
+    unlink(req_fifo);
+    unlink(res_fifo);
+
+    return 0;
+}
